@@ -1,0 +1,2 @@
+python train_model_original.py --TextArgs=config/SERVER_DQSELD-TCN-S1-PHI_8ch.txt
+python train_model_update.py --TextArgs=config/SERVER_DQSELD-TCN-S1-PHI_8ch.txt
