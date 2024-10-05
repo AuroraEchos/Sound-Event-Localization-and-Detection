@@ -1,7 +1,6 @@
 import numpy as np
 eps = np.finfo(float).eps
 from scipy.optimize import linear_sum_assignment
-from IPython import embed
 class SELDMetrics(object):
     def __init__(self, doa_threshold=20, nb_classes=14):
         '''

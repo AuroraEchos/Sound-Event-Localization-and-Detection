@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torchinfo import summary
 
-import math
 import numpy as np
 import utility_functions as uf
 from dual_quaternion.dual_quaternion_layers import * 
@@ -10,80 +9,48 @@ from quaternion.quaternion_layers import *
 
 torch.backends.cudnn.enabled = False
 
-class SelfAttention(nn.Module):
-    """
-    实现了一个基本的自注意力机制，它接受输入张量，计算查询、键和值，
-    然后通过点积计算注意力分数，并将注意力分数应用于值张量，
-    最后返回加权的值张量以及注意力权重。
-
-    关键点：MASK掩码用于防止模型看到未来的时间步，从而实现因果注意力。
-
-    注：该代码是简单修改后的版本，与原作者代码略有不同。
-    1、原作者代码中的mask是ByteTensor类型，但是在PyTorch 1.2.0版本中，ByteTensor已经被废弃，使用bool类型代替。
-    2、在注意力权重和最终的输出之间通常会有dropout层，但是原作者代码中没有实现，这里添加了dropout层以防止过拟合。
-    3、在注意力计算中，通常会对最后一个维度进行softmax操作，而不是中间的维度。
-    在典型的注意力机制中，我们希望计算每个查询和键之间的关联度，然后根据这些关联度对值进行加权求和。
-    具体来说，我们将查询与键的乘积作为注意力分数，并通过 softmax 函数将这些分数归一化为概率分布。
-    softmax 操作应用在最后一个维度上，以确保每个查询对应的注意力权重总和为 1。
-    """
-    def __init__(self, in_channels, key_size=8, value_size=16):
-        super(SelfAttention, self).__init__()
-        self.linear_query = nn.Linear(in_channels, key_size)
-        self.linear_keys = nn.Linear(in_channels, key_size)
-        self.linear_values = nn.Linear(in_channels, value_size)
-        self.linear_output = nn.Linear(value_size, in_channels)  # 添加线性变换，将输出调整回 in_channels
-        self.sqrt_key_size = math.sqrt(key_size)
-        self.dropout = nn.Dropout(0.1)
-
-    def forward(self, input):
-        # input is dim (N, in_channels, T) where N is the batch_size, and T is the sequence length
-        mask = np.array([[1 if i > j else 0 for i in range(input.size(2))] for j in range(input.size(2))])
-        mask = torch.tensor(mask, dtype=torch.bool, device=input.device)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_size, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        assert embed_size % num_heads == 0, "Embedding size must be divisible by number of heads"
         
-        input = input.permute(0, 2, 1)  # input: [N, T, in_channels]
-        keys = self.linear_keys(input)  # keys: (N, T, key_size)
-        query = self.linear_query(input)  # query: (N, T, key_size)
-        values = self.linear_values(input)  # values: (N, T, value_size)
-
-        temp = torch.bmm(query, torch.transpose(keys, 1, 2)) / self.sqrt_key_size  # shape: (N, T, T)
-        temp.data.masked_fill_(mask, -float('inf'))
-
-        weight_temp = F.softmax(temp, dim=-1)
-        weight_temp = self.dropout(weight_temp)  # Apply dropout to attention weights
-        value_attentioned = torch.bmm(weight_temp, values)  # shape: (N, T, value_size)
-
-        value_attentioned = self.linear_output(value_attentioned).permute(0, 2, 1)  # shape: (N, in_channels, T)
-      
-        return value_attentioned, weight_temp  # output: (N, in_channels, T), attention_weights: (N, T, T)
-
-class SqueezeExcitation(nn.Module):
-    """
-    压缩-激励模块
-    适合用在每个卷积层后面，以增强通道间的特征表示
-    动态地调整每个通道的权重，从而提升模型的表现。
-    """
-    def __init__(self, in_channels, reduction=16):
-        super(SqueezeExcitation, self).__init__()
-        self.fc1 = nn.Conv1d(in_channels, in_channels // reduction, 1)
-        self.fc2 = nn.Conv1d(in_channels // reduction, in_channels, 1)
-        self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        batch_size, C, H, W = x.size()
-        squeeze = x.mean(2)  # Average pooling on height dimension
-        excitation = self.fc1(squeeze)
-        excitation = self.relu(excitation)
-        excitation = self.fc2(excitation)
-        excitation = self.sigmoid(excitation)
-        out = x * excitation.unsqueeze(2)  # unsqueeze to match original dimensions
+        self.num_heads = num_heads
+        self.head_dim = embed_size // num_heads
+        
+        self.values = nn.Conv1d(embed_size, embed_size, kernel_size=1, bias=False)
+        self.keys = nn.Conv1d(embed_size, embed_size, kernel_size=1, bias=False)
+        self.queries = nn.Conv1d(embed_size, embed_size, kernel_size=1, bias=False)
+        self.fc_out = nn.Linear(embed_size, embed_size)
+        
+    def forward(self, v, k, q, mask=None):
+        N = q.shape[0]
+        value_len, key_len, query_len = v.shape[1], k.shape[1], q.shape[1]
+        
+        # Transpose to (batch_size, embed_size, seq_length) for Conv1d
+        v = v.permute(0, 2, 1)
+        k = k.permute(0, 2, 1)
+        q = q.permute(0, 2, 1)
+        
+        # Apply convolution
+        v = self.values(v).view(N, self.head_dim * self.num_heads, value_len).permute(0, 2, 1).view(N, value_len, self.num_heads, self.head_dim)
+        k = self.keys(k).view(N, self.head_dim * self.num_heads, key_len).permute(0, 2, 1).view(N, key_len, self.num_heads, self.head_dim)
+        q = self.queries(q).view(N, self.head_dim * self.num_heads, query_len).permute(0, 2, 1).view(N, query_len, self.num_heads, self.head_dim)
+        
+        # Scaled dot-product attention
+        energy = torch.einsum("nqhd,nkhd->nhqk", [q, k])
+        
+        if mask is not None:
+            # Apply mask to the energy tensor
+            energy = energy.masked_fill(mask == 0, float("-1e9"))
+        
+        attention = torch.softmax(energy / (self.head_dim ** (1 / 2)), dim=3)
+        
+        out = torch.einsum("nhql,nlhd->nqhd", [attention, v]).reshape(N, query_len, -1)
+        out = self.fc_out(out)
+        
         return out
-    
+
 class ResBlock(nn.Module):
-    """
-    这个是一个残差块，包含两个卷积层，一个跳跃连接和一个残差连接。
-    此模块可以选择使用常规卷积、四元数卷积（Quaternion Convolution）或双四元数卷积（Dual Quaternion Convolution）来处理输入数据。
-    """
     def __init__(self, in_channels, 
         domain='DQ',
         G=128,U=128, kernel_size_dilated_conv=3, dilation=1, stride=1,
@@ -118,9 +85,11 @@ class ResBlock(nn.Module):
                                     stride=stride, padding=padding,
                                     dilation=dilation,bias=use_bias_conv)
 
-        if batch_norm=='BN'or batch_norm=='BN_on_TCN'or batch_norm=='BNonTCN':
-            self.batch_filter=nn.BatchNorm1d(G)
-            self.batch_gate=nn.BatchNorm1d(G)
+        if batch_norm in {'BN', 'BN_on_TCN', 'BNonTCN'}:
+            self.batch_filter1 = nn.BatchNorm1d(L)
+            self.batch_gate1 = nn.BatchNorm1d(L)
+            self.batch_filter2 = nn.BatchNorm1d(G)
+            self.batch_gate2 = nn.BatchNorm1d(G)
                 
         self.tanh = nn.Tanh()
         self.sigmoid = nn.Sigmoid()
@@ -139,33 +108,34 @@ class ResBlock(nn.Module):
             
     def forward(self, x):
         """
-        输入形状：(batch_size, in_channels, sequence_length)
-
-        输出返回两个张量：一个是残差连接，一个是跳跃连接
-            残差输出形状：(batch_size, in_channels, sequence_length)，它的形状与输入形状相同，因为残差连接需要保持维度一致。
-            跳跃连接输出形状：(batch_size, out_channels, sequence_length)，它的形状与卷积层的输出形状相同。
+        修改现有的残差块为预激活残差块
+        预处理残差块通过将批归一化和激活函数提前应用于卷积之前，改善了梯度传播，提升了训练稳定性，提供了有效的正则化效果，并在实际任务中带来了性能提升。
         """
+        if self.batch_norm in {'BN', 'BN_on_TCN', 'BNonTCN'}:
+            x = self.batch_filter1(x)
+            x = self.tanh(x)
+        
         y_f=self.conv1_filter(x)
         y_g=self.conv1_gate(x)
-        if self.batch_norm in {'BN','BN_on_TCN','BNonTCN'}:
-            y_f=self.batch_filter(y_f)
-            y_g=self.batch_gate(y_g)
+
+        if self.batch_norm in {'BN', 'BN_on_TCN', 'BNonTCN'}:
+            y_f = self.batch_filter2(y_f)
+            y_g = self.batch_gate2(y_g)
+        
         y=self.tanh(y_f)*self.sigmoid(y_g)
+
         if(not self.spatial_dropout_rate==0):
             y=self.dropout(y)
+            
         y_skip=self.conv2_skip(y)
         y_residual=self.conv2_residual(y)
         return x+y_residual,y_skip
 
 class TC_Block(nn.Module):
-    """
-    通过多个残差块和卷积层进行特征提取和下采样。
-    该模块支持不同的域（如常规卷积、四元数卷积和双四元数卷积）以及不同的池化和批量归一化选项。
-    """
     def __init__(self, in_channels, domain='DQ', 
                 G=128,U=128, V=[128,128], V_kernel_size=3,pool_size=[[8,2],[8,2],[2,2]], D=[10], 
                 spatial_dropout_rate=0.5, use_bias_conv=True,dilation_mode='fibonacci', pool_time='TCN',batch_norm='BN',
-                kernel_size_dilated_conv=3,verbose=False):
+                kernel_size_dilated_conv=3,verbose=False, attention_type=None, key_size=None, value_size=None):
         super(TC_Block, self).__init__()
         self.verbose = verbose
         self.ResBlocks = nn.ModuleList()
@@ -174,11 +144,6 @@ class TC_Block(nn.Module):
         self.domain = domain
 
         for n_resblock in D:
-            """
-            段代码根据 D 中的设定，循环创建多个残差块。
-            并根据不同的设定来确定每个残差块的扩张率，最终将这些残差块存储在 self.ResBlocks 列表中，以供后续在模型中使用。
-            --这段代码和论文中的相照应
-            """
             dilation=1
             prec_1=1
             prec_2=0
@@ -207,7 +172,6 @@ class TC_Block(nn.Module):
                                                     G=G,U=U,kernel_size_dilated_conv=kernel_size_dilated_conv, 
                                                     dilation=dilation, spatial_dropout_rate=spatial_dropout_rate, 
                                                     use_bias_conv=use_bias_conv,batch_norm=batch_norm,verbose=verbose))
-
         self.relu1=nn.ReLU()
 
         if self.pool_time=='TCN':
@@ -219,6 +183,9 @@ class TC_Block(nn.Module):
             self.conv1 = DualQuaternionConv(in_channels, V[0], kernel_size=V_kernel_size, stride=1,padding=1, bias=use_bias_conv, operation='convolution1d')
         else:
             self.conv1 = nn.Conv1d(in_channels,V[0], kernel_size=V_kernel_size, stride=1,padding=1,bias=use_bias_conv)
+        
+        self.attention = MultiHeadAttention(embed_size=V[0], num_heads=8)
+        
         self.relu2=nn.ReLU()
 
         if self.pool_time=='TCN':
@@ -233,28 +200,13 @@ class TC_Block(nn.Module):
         self.tanh=nn.Tanh()
         if self.pool_time=='TCN':
             self.maxpool3=nn.MaxPool1d(pool_size[2][1])
-
-        """
-        从第145行到第169行：
-        根据条件选择不同类型的激活函数、池化层和卷积层，构建一个卷积块的组成部分，用于在模型中进行特征提取和处理。
-            1. RELU 激活函数，最大池化层
-            2. 卷积层，RELU 激活函数, 最大池化层
-            3. 卷积层，Tanh 激活函数，最大池化层
-
-        """
             
     def forward(self, residual):
-        """
-        输入：残差连接，形状为(batch_size, in_channels, sequence_length)。
-        输出：特征提取和下采样后的张量(处理后的特征图)，形状为(batch_size, out_channels, sequence_length), 形状根据网络的配置和池化操作的应用可能有所不同。
-        """
-        # 遍历残差块列表
         skip_connections=[]
         for i in range(len(self.ResBlocks)):
             residual,skip=self.ResBlocks[i](residual)
             skip_connections.append(skip)
 
-        # 计算所有跳跃连接的和
         sum_skip=skip_connections[0]
         for i in range(1,len(skip_connections)):
             sum_skip+=skip_connections[i]
@@ -264,21 +216,22 @@ class TC_Block(nn.Module):
         if self.pool_time=='TCN':
             out=self.maxpool1(out)
         out= self.conv1(out)
+
+        out = out.permute(0,2,1)
+        out = self.attention(out, out, out, mask=None)
+        out = out.permute(0,2,1)
+
         out= self.relu2(out)
         if self.pool_time=='TCN':
             out=self.maxpool2(out)
         out= self.conv2(out)
+
         out= self.tanh(out)
         if self.pool_time=='TCN':
             out=self.maxpool3(out)
         return out
-    
 
 class ConvTC_Block(nn.Module):
-    """
-    结合了卷积神经网络（CNN）和时间卷积网络（TCN）。
-    它的目的是通过卷积层提取特征，然后使用时间卷积网络在时间维度上处理这些特征。
-    """
     def __init__(self, time_dim, freq_dim=256, input_channels=4, 
                  domain='DQ',
                  cnn_filters=[64,64,64], kernel_size_cnn_blocks=3, pool_size=[[8,2],[8,2],[2,2]], pool_time='TCN',
@@ -306,18 +259,6 @@ class ConvTC_Block(nn.Module):
         in_chans = input_channels
         
         for i, (p,c) in enumerate(zip(pool_size, np.array(cnn_filters))):
-            """
-            这段代码的主要作用是初始化 ConvTC_Block 类中的多个卷积块
-            每个卷积块包括：
-                1. 一个卷积层
-                2. 一个批量归一化层
-                3. 一个 ReLU 激活函数
-                4. 一个最大池化层
-                5. 一个 Dropout 层
-
-            --该模块和论文中所提到的模块相对应
-            """
-            
             curr_chans = c
 
             if pool_time=='CNN':
@@ -343,46 +284,17 @@ class ConvTC_Block(nn.Module):
             layers_list=[]
             in_chans = curr_chans
 
-            # SE module
-            se_layer = SqueezeExcitation(curr_chans)
-            conv_layers.append(se_layer)
-
-            in_chans = curr_chans
-
-
         self.cnn = nn.Sequential(*conv_layers)
-        """
-        这行代码的作用是创建一个由多个卷积层组成的神经网络模块，并将这些层按顺序组合起来。
-        把列表 conv_layers 中的所有层按照顺序连接起来，形成一个整体的卷积神经网络模块 self.cnn。
-        这样定义后，可以通过调用 self.cnn(input) 来对输入数据进行顺序的前向传播，依次经过每一层的计算，最终得到输出。
-        """
         L = int(freq_dim / np.prod(np.array(pool_size), axis=0)[0]*cnn_filters[-1])#input dimension for QTCN Block
-
-        if attention_type=='self_attention':
-            self.attention = SelfAttention(in_channels=L, key_size=key_size, value_size=value_size)
-        elif attention_type=='squeeze_excitation':
-            self.attention = SqueezeExcitation(in_channels=L)
-        else:
-            self.attention = None
 
         self.tcn=TC_Block(in_channels=L, domain=domain,
                 G=G,U=U,V=V,V_kernel_size=V_kernel_size, pool_size=pool_size, D=D, 
                 spatial_dropout_rate=spatial_dropout_rate, use_bias_conv=use_bias_conv,
                 dilation_mode=dilation_mode, pool_time=pool_time,batch_norm=batch_norm,
-                kernel_size_dilated_conv=kernel_size_dilated_conv,verbose=verbose)
+                kernel_size_dilated_conv=kernel_size_dilated_conv,verbose=verbose,attention_type=attention_type,key_size=key_size,value_size=value_size)
 
         
     def forward(self, x):
-        """
-        输入形状：(batch_size, input_channels, time_dim, freq_dim)，音频信号的短时傅里叶变换（STFT）输出
-        输出形状：(batch_size, time_pooled_size, out_channels)，经过卷积和时间卷积网络处理后的特征
-
-        流程：
-        1. 通过 CNN 特征提取器
-        2. 维度调整以适应 TCN 输入
-        3. 通过 TCN 处理特征
-        4. 维度调整以适应输出
-        """
         x = self.cnn(x)
         if self.verbose:
             print ('cnn out ', x.shape)    
@@ -399,11 +311,6 @@ class ConvTC_Block(nn.Module):
         if self.verbose:
             print ('permute2: ', x.shape)   
         
-        if self.attention is not None:
-            x, _ = self.attention(x)
-            if self.verbose:
-                print ('attention out: ', x.shape)
-        
         x= self.tcn(x)
         
         if self.verbose:
@@ -413,12 +320,8 @@ class ConvTC_Block(nn.Module):
         if self.verbose:
             print ('permute3: ', x.shape)   
         return x
-    
 
 class SELD_Model(nn.Module):
-    """
-    通过结合卷积神经网络（CNN）和时间卷积网络（TCN）来提取特征，并通过全连接层进行分类和定位。
-    """
     def __init__(self, time_dim, freq_dim=256, input_channels=4, output_classes=14,
                  domain='DQ',domain_classifier='same', 
                  cnn_filters=[64,64,64], kernel_size_cnn_blocks=3, pool_size=[[8,2],[8,2],[2,2]], pool_time='TCN',
@@ -441,8 +344,34 @@ class SELD_Model(nn.Module):
         self.receptive_field, self.total_n_resblocks=self.calculate_receptive_field()
         self.parallel_ConvTC_block=parallel_ConvTC_block
 
-        # 为了方便理解，将源代码中的英文注释翻译成中文，并添加一个打印函数
-        if domain in {'q', 'Q', 'quaternion', 'Quaternion'}:
+        if domain in{'q','Q','quaternion','Quaternion'}:
+            self.model_name='Q'
+        elif domain in{'dq','dQ','DQ','dual_quaternion','Dual_Quaternion'}:
+            self.model_name='DualQ'
+        else:
+            self.model_name=''
+        self.model_name+='SELD'
+        self.model_name+='-TCN'
+        if dilation_mode=='fibonacci':
+            self.model_name+='-PHI'
+        self.model_name+='-'
+        if len(D)>1:
+            if D[0]<D[1]:
+                self.model_name+='I'
+        self.model_name+='S'+str(len(D))
+        #self.model_name+='_D_'+str(D)
+        if parallel_ConvTC_block not in {'False','false','None','none'}:
+            self.model_name+='_'+parallel_ConvTC_block
+        self.model_name+='_'+batch_norm
+        #if pool_time=='TCN':
+        #    self.model_name+='_ptTCN'
+        if pool_time=='CNN':
+            self.model_name+='_pooltCNN'
+        self.model_name+='_RF{}_{}RB'.format(self.receptive_field,self.total_n_resblocks)
+        
+        self.model_name+=extra_name
+
+        """ if domain in {'q', 'Q', 'quaternion', 'Quaternion'}:
             self.model_name = '四元数'
         elif domain in {'dq', 'dQ', 'DQ', 'dual_quaternion', 'Dual_Quaternion'}:
             self.model_name = '双四元数'
@@ -467,8 +396,8 @@ class SELD_Model(nn.Module):
             self.model_name += '_池化时间维度CNN'
         self.model_name += '_感受野为{}_残差块个数为{}'.format(self.receptive_field, self.total_n_resblocks)
 
-        self.model_name += extra_name
-        self.print_model_name(self.model_name)
+        self.model_name += extra_name """
+        #self.print_model_name(self.model_name)
 
         sed_output_size = int(output_classes * class_overlaps)    #here 3 is the max number of simultaneus sounds from the same class
         doa_output_size = sed_output_size * 3   #here 3 is the number of spatial dimensions xyz
@@ -530,12 +459,6 @@ class SELD_Model(nn.Module):
                     nn.Tanh())
 
     def forward(self, x):
-        """
-        输入形状：(batch_size, input_channels, time_dim, freq_dim)，音频信号的短时傅里叶变换（STFT）输出
-        输出形状：(batch_size, time_pooled_size, out_channels)，经过卷积和时间卷积网络处理后的特征
-            sed 输出形状：(batch_size, time_pooled_size, sed_output_size)，表示在每个时间步长的每个类别的事件检测结果, sed_output_size：输出类别数乘以同时发生的最大声音事件数。
-            doa 输出形状：(batch_size, time_pooled_size, doa_output_size)，表示在每个时间步长的每个类别的方向角检测结果, doa_output_size：sed_output_size 乘以 3（xyz）。
-        """
         if self.parallel_ConvTC_block in {'2Parallel','2BParallel','2ParallelBranches','2PB'}:
             if self.parallel_magphase:
                 x_A=torch.cat((x[:,:4,:,:],x[:,8:12,:,:]),1)####X_A MicA mag-phase
@@ -685,7 +608,7 @@ if __name__ == '__main__':
     print ('\n输入形状: ', sp.shape)
     sed, doa = model(sp)
 
-    #target shape sed=[batch,600(label frames),42] doa=[batch, 600(label frames),126](这个注释是原作者的，经验证没有问题)
+    #target shape sed=[batch,600(label frames),42] doa=[batch, 600(label frames),126]
     print('\n输出形状: ','SED shape: ', sed.shape, '| DOA shape: ', doa.shape)
 
     print("\n模型详细结构如下: ")

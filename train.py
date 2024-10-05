@@ -1,28 +1,208 @@
-import torch
-import numpy as np
+
+#from evaluate_baseline_task2 import evaluate_model
+import sys, os
+import time
+import json
 import pickle
 import argparse
-import os
+from tqdm import tqdm
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.optim.lr_scheduler import StepLR 
 import torch.utils.data as utils
 
+from utility_functions import save_array_to_csv,gen_submission_list_task2, readFile
+from metrics import location_sensitive_detection
+import shutil
 from torchinfo import summary
+import wandb
+from Dcase21_metrics import *
+
 from model import SELD_Model
 
-def readFile(path):
+
+def save_model(model, optimizer, state, path,scheduler=None):
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module  # save state dict of wrapped module
+    if len(os.path.dirname(path)) > 0 and not os.path.exists(os.path.dirname(path)):
+        os.makedirs(os.path.dirname(path))
+    if scheduler is not None:
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'state': state,  # state of training loop (was 'step')
+            'scheduler_state_dict' : scheduler.state_dict(),
+            'random_states':(np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
+        }, path)
+    else:
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'state': state,  # state of training loop (was 'step')
+            'random_states':(np.random.get_state(), torch.get_rng_state(), torch.cuda.get_rng_state() if torch.cuda.is_available() else None)
+        }, path)
+
+def load_model(model, optimizer, path, cuda, device,scheduler=None):
+
+    if isinstance(model, torch.nn.DataParallel):
+        model = model.module  # load state dict of wrapped module
+    if cuda:
+        checkpoint = torch.load(path, map_location=device)
+    else:
+        checkpoint = torch.load(path, map_location='cpu')
+    try:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    except:
+        # work-around for loading checkpoints where DataParallel was saved instead of inner module
+        from collections import OrderedDict
+        model_state_dict_fixed = OrderedDict()
+        prefix = 'module.'
+        for k, v in checkpoint['model_state_dict'].items():
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+            model_state_dict_fixed[k] = v
+        model.load_state_dict(model_state_dict_fixed)
+    if optimizer is not None:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler is not None:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    if 'state' in checkpoint:
+        state = checkpoint['state']
+    else:
+        # older checkpoints only store step, rest of state won't be there
+        state = {'step': checkpoint['step']}
     
-    with open(path, 'r') as f:
-        r = f.read()
-        r = r.replace('=', '+').replace('\n', '+').split('+')
-        new_r = []
-        for i in r:
-            if i=='True':
-                new_r.append('1')
-            elif i == 'False':
-                new_r.append(0)
-            elif i !='' and '#' not in i:
-                new_r.append(i)
-    # print(new_r)
-    return new_r
+    np.random.set_state(checkpoint['random_states'][0])
+    torch.set_rng_state(checkpoint['random_states'][1].cpu())
+    if torch.cuda.is_available() and checkpoint['random_states'][2] is not None:
+        torch.cuda.set_rng_state(checkpoint['random_states'][2].cpu())
+    return state
+
+
+def evaluate_test(model,device, dataloader,epoch=0,max_loc_value=2.,num_frames=600,spatial_threshold=2.):
+    TP = 0
+    FP = 0
+    FN = 0
+    count = 0
+    output_classes=args.output_classes
+    class_overlaps=args.class_overlaps
+
+    model.eval()
+    
+    eval_metrics = SELDMetrics(nb_classes=output_classes, doa_threshold=args.Dcase21_metrics_DOA_threshold)
+    
+    with tqdm(total=len(dataloader) // 1) as pbar, torch.no_grad():
+        for example_num, (x, target) in enumerate(dataloader):
+            x = x.to(device)
+            target = target.to(device)
+            
+            sed, doa = model(x)
+            sed = sed.cpu().numpy().squeeze()
+            doa = doa.cpu().numpy().squeeze()
+            target = target.cpu().numpy().squeeze()
+            #in the target matrices sed and doa are joint
+            sed_target = target[:,:args.output_classes*args.class_overlaps]
+            doa_target = target[:,args.output_classes*args.class_overlaps:]
+
+            
+            prediction,prediction_dict = gen_submission_list_task2(sed, doa,
+                                                    max_overlaps=class_overlaps,
+                                                    max_loc_value=max_loc_value)
+
+            target,target_dict = gen_submission_list_task2(sed_target, doa_target,
+                                                max_overlaps=class_overlaps,
+                                                max_loc_value=max_loc_value)
+    
+            pred_labels =segment_labels(prediction_dict, num_frames)
+            ref_labels =segment_labels(target_dict, num_frames)
+            # Calculated scores
+            eval_metrics.update_seld_scores(pred_labels, ref_labels)
+            tp, fp, fn, _ = location_sensitive_detection(prediction, target, num_frames,
+                                                      spatial_threshold, False)
+            TP += tp
+            FP += fp
+            FN += fn
+
+            count += 1
+            pbar.update(1)
+
+
+    #compute total F score
+    precision = TP / (TP + FP + sys.float_info.epsilon)
+    recall = TP / (TP + FN + sys.float_info.epsilon)
+    F_score = 2 * ((precision * recall) / (precision + recall + sys.float_info.epsilon))
+    Nref=TP+FN
+    Nsys=TP+FP
+    ER_score = (max(Nref, Nsys) - TP) / (Nref + 0.0)
+    
+    ER_dcase21, F_dcase21, LE_dcase21, LR_dcase21 = eval_metrics.compute_seld_scores()
+
+    SELD_dcase21 = np.mean([ER_dcase21,1 -  F_dcase21, LE_dcase21/180,1 - LR_dcase21])
+    SELD_L3DAS21_LRLE = np.mean([ER_score,1 -  F_score, LE_dcase21/180,1 - LR_dcase21])
+    CSL_score= np.mean([LE_dcase21/180,1 - LR_dcase21])
+    LSD_score=np.mean([1-F_score,ER_score])
+    test_results=[epoch,F_score,ER_score,precision,recall,TP,FP,FN,
+                    CSL_score,LSD_score,SELD_L3DAS21_LRLE,
+                    SELD_dcase21,ER_dcase21, F_dcase21, LE_dcase21, LR_dcase21]
+    
+
+    #visualize and save results
+    print ('*******************************')
+    print ('RESULTS')
+    print  ('TP: ' , TP)
+    print  ('FP: ' , FP)
+    print  ('FN: ' , FN)
+    print ('******** SELD (F ER L3DAS21 - LE LR DCASE21) ***********')
+    print ('Global SELD score: ', SELD_L3DAS21_LRLE)
+    print ('LSD score: ', LSD_score)
+    print ('CSL score: ', CSL_score)
+    print ('F score: ', F_score)
+    print ('ER score: ', ER_score)
+    print ('LE: ', LE_dcase21)
+    print ('LR: ', LR_dcase21)
+    
+    return test_results
+
+def evaluate(model, device, criterion_sed, criterion_doa, dataloader):
+    #compute loss without backprop
+    model.eval()
+    test_loss = 0.
+    with tqdm(total=len(dataloader) // args.batch_size) as pbar, torch.no_grad():
+        for example_num, (x, target) in enumerate(dataloader):
+            target = target.to(device)
+            x = x.to(device)
+            t = time.time()
+            # Compute loss for each instrument/model
+            #sed, doa = model(x)
+            loss = seld_loss(x, target, model, criterion_sed, criterion_doa)
+            test_loss += (1. / float(example_num + 1)) * (loss - test_loss)
+            pbar.set_description("Current loss: {:.4f}".format(test_loss))
+            pbar.update(1)
+    return test_loss
+
+
+def seld_loss(x, target, model, criterion_sed, criterion_doa):
+    '''
+    compute seld loss as weighted sum of sed (BCE) and doa (MSE) losses
+    '''
+    #divide labels into sed and doa  (which are joint from the preprocessing)
+    target_sed = target[:,:,:args.output_classes*args.class_overlaps]
+    target_doa = target[:,:,args.output_classes*args.class_overlaps:]
+
+    #compute loss
+    sed, doa = model(x)
+    
+    sed = torch.flatten(sed, start_dim=1)
+    doa = torch.flatten(doa, start_dim=1)
+    target_sed = torch.flatten(target_sed, start_dim=1)
+    target_doa = torch.flatten(target_doa, start_dim=1)
+    loss_sed = criterion_sed(sed, target_sed) * args.sed_loss_weight
+    loss_doa = criterion_doa(doa, target_doa) * args.doa_loss_weight
+    
+    return loss_sed + loss_doa
+
 
 def main(args):
 
@@ -243,6 +423,8 @@ def main(args):
         print ('Test target: ', test_target.shape)
     
     ###############################################################################
+
+
     features_dim = int(test_target.shape[-2] * test_target.shape[-1])
 
     #convert to tensor
@@ -276,7 +458,7 @@ def main(args):
                  extra_name=args.model_extra_name, verbose=False)
     
                  
-    architecture_dir='RESULTS/Task2/{}/'.format(args.architecture)
+    architecture_dir='RESULTS_Original/Task2/{}/'.format(args.architecture)
     if len(os.path.dirname(architecture_dir)) > 0 and not os.path.exists(os.path.dirname(architecture_dir)):
         os.makedirs(os.path.dirname(architecture_dir))
     model_dir=architecture_dir+model.model_name+'/'
@@ -309,8 +491,230 @@ def main(args):
     #compute number of parameters
     model_params = sum([np.prod(p.size()) for p in model.parameters()])
     print ('Total paramters: ' + str(model_params))
+    '''
+    wandb.config.n_Parameters=model_params'''
 
+    #set up the loss functions
+    criterion_sed = nn.BCELoss()
+    criterion_doa = nn.MSELoss()
+
+    #set up optimizer
+    optimizer = Adam(params=model.parameters(), lr=args.lr)
     
+    ################################################################### DYNAMIC LEARNING RATE
+    if args.use_lr_scheduler:
+        scheduler = StepLR(optimizer, step_size=args.lr_scheduler_step_size, gamma=args.lr_scheduler_gamma, verbose=True)
+    else:
+        scheduler=None
+    ###################################################################
+    #set up training state dict that will also be saved into checkpoints
+    state = {"step" : 0,
+             "worse_epochs" : 0,
+             "epochs" : 0,
+             "best_loss" : np.Inf,
+             "best_epoch" : 0,
+             "best_test_epoch":0,
+             "torch_seed_state":torch.get_rng_state(),
+             "numpy_seed_state":np.random.get_state()
+            
+             }
+    epoch =0
+    best_loss_checkpoint=np.inf
+    best_test_metric=1
+    #load model checkpoint if desired
+    if args.load_model is not None and os.path.isfile(args.load_model) :####################################### added "and os.path.isfile(args.load_model)"
+        print("Continuing training full model from checkpoint " + str(args.load_model))
+        state = load_model(model, optimizer, args.load_model, args.use_cuda,device,scheduler)
+        epoch=state["epochs"]#######################################################################
+    new_best=False
+    test_best_results=[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+    best_epoch_checkpoint = epoch
+    
+
+    #TRAIN MODEL
+    print('TRAINING START')
+    train_loss_hist = []
+    val_loss_hist = []
+    while state["worse_epochs"] < args.patience or epoch<args.min_n_epochs:
+        epoch += 1
+        state["epochs"] += 1
+        print("Training epoch " + str(epoch) +' of '+model.model_name, ' with lr ', optimizer.param_groups[0]['lr'])
+        avg_time = 0.
+        model.train()
+        train_loss = 0.
+        with tqdm(total=len(tr_dataset) // args.batch_size) as pbar:
+            for example_num, (x, target) in enumerate(tr_data):
+                target = target.to(device)
+                #print(x.shape)
+                x = x.to(device)
+                t = time.time()
+                # Compute loss for each instrument/model
+                optimizer.zero_grad()
+                #print(x.shape)
+                #sed, doa = model(x)
+                #print(x.shape)
+                loss = seld_loss(x, target, model, criterion_sed, criterion_doa)
+                loss.backward()
+
+                train_loss += (1. / float(example_num + 1)) * (loss - train_loss)
+                optimizer.step()
+                state["step"] += 1
+                t = time.time() - t
+                avg_time += (1. / float(example_num + 1)) * (t - avg_time)
+
+                pbar.update(1)
+
+            #PASS VALIDATION DATA 验证模型
+            val_loss = evaluate(model, device, criterion_sed, criterion_doa, val_data)
+            
+            if args.use_lr_scheduler and optimizer.param_groups[0]['lr']>args.min_lr:
+                scheduler.step()######################################################################Dynamic learning rate
+            
+
+            # EARLY STOPPING CHECK 早停机制
+            #############################################################################
+            
+            checkpoint_path = os.path.join(model_dir, "checkpoint")
+            checkpoint_best_model_path = os.path.join(model_dir, "checkpoint_best_model")
+            checkpoint_best_model_checkpoint_path = os.path.join(model_dir, "checkpoint_best_model_of_checkpoint")
+
+
+            
+            #state["worse_epochs"] = 200
+            train_loss_hist.append(train_loss.cpu().detach().numpy())
+            val_loss_hist.append(val_loss.cpu().detach().numpy())
+
+
+            if val_loss >= state["best_loss"]:
+                state["worse_epochs"] += 1
+                
+            else:
+                if new_best==True:
+                    best_loss_checkpoint =state["best_loss"] 
+                    best_epoch_checkpoint = state["best_epoch"]
+                    shutil.copyfile(checkpoint_best_model_path, checkpoint_best_model_checkpoint_path)
+                    
+                print("MODEL IMPROVED ON VALIDATION SET!")
+                state["worse_epochs"] = 0
+                state["best_loss"] = val_loss
+                state["best_epoch"] = epoch
+                state["best_checkpoint"] = checkpoint_best_model_path
+                new_best=True
+
+                # CHECKPOINT
+                print("Saving best model...")
+                save_model(model, optimizer, state, checkpoint_best_model_path,scheduler)
+
+            if val_loss < best_loss_checkpoint and (val_loss!=state["best_loss"] or best_loss_checkpoint==np.inf):
+                best_loss_checkpoint = val_loss
+                print("Saving best model checkpoint...")
+                save_model(model, optimizer, state, checkpoint_best_model_checkpoint_path,scheduler)
+                best_epoch_checkpoint = epoch
+
+
+            print("Saving model...")
+            save_model(model, optimizer, state, checkpoint_path,scheduler)
+            print("VALIDATION FINISHED: TRAIN_LOSS: {}  VAL_LOSS: {}".format(str(train_loss.cpu().detach().numpy().round(4)), str(val_loss.cpu().detach().numpy().round(4))))
+            print("Best epoch at: {} Best loss: {}".format(state['best_epoch'],str(state['best_loss'].cpu().detach().numpy().round(4))))
+
+            plot_array=[epoch, train_loss.cpu().detach().numpy(), val_loss.cpu().detach().numpy()]
+            save_array_to_csv("{}_training_metrics.csv".format(unique_name), plot_array)###################################
+            
+            '''wandb.log({"train loss": train_loss.cpu().detach().numpy()},step=epoch)#################################################### WANDB
+            wandb.log({"val loss":val_loss.cpu().detach().numpy()},step=epoch)
+            '''
+
+            #TEST############################################################################################################
+            if epoch%args.test_step==0:
+                if args.test_mode=='test_best':
+                    if new_best:
+                        print ('\n***************TEST BEST MODEL AT EPOCH {}****************'.format(state["best_epoch"]))
+                        state = load_model(model, optimizer, checkpoint_best_model_path, args.use_cuda,device,scheduler)
+                        test_best_results=evaluate_test(model,device, test_data,epoch=state['best_epoch'],max_loc_value=args.max_loc_value,num_frames=args.num_frames,spatial_threshold=args.spatial_threshold)
+                        save_array_to_csv("{}_test_metrics.csv".format(unique_name), test_best_results)
+                    else:
+                        print ('\n***************TEST MODEL AT EPOCH {}****************'.format(best_epoch_checkpoint))
+                        state = load_model(model, optimizer, checkpoint_best_model_checkpoint_path, args.use_cuda,device,scheduler)
+                        test_best_results=evaluate_test(model,device, test_data,epoch=best_epoch_checkpoint,max_loc_value=args.max_loc_value,num_frames=args.num_frames,spatial_threshold=args.spatial_threshold)
+                        save_array_to_csv("{}_test_metrics.csv".format(unique_name), test_best_results)
+                else:
+                    print ('\n***************TEST MODEL AT EPOCH {}****************'.format(epoch))
+                    test_best_results=evaluate_test(model,device, test_data,epoch=epoch,max_loc_value=args.max_loc_value,num_frames=args.num_frames,spatial_threshold=args.spatial_threshold)
+                    save_array_to_csv("{}_test_metrics.csv".format(unique_name), test_best_results)
+                '''
+                wandb.log({"F-Score": test_best_results[1]},step=epoch)#################################################### WANDB
+                wandb.log({"ER-Score": test_best_results[2]},step=epoch)
+                wandb.log({"Precision": test_best_results[3]},step=epoch)
+                wandb.log({"Recall": test_best_results[4]},step=epoch)
+                wandb.log({"LR Localization Recall (DCASE21)": test_best_results[-1]},step=epoch)
+                wandb.log({"LE Localization Error (DCASE21)": test_best_results[-2]},step=epoch)
+                wandb.log({"F (DCASE21)": test_best_results[-3]},step=epoch)
+                wandb.log({"ER (DCASE21)": test_best_results[-4]},step=epoch)
+                wandb.log({"SELD Score (DCASE21)": test_best_results[-5]},step=epoch)      
+                wandb.log({"Global SELD (F ER L3DAS21 - LE LR DCASE21)": test_best_results[-6]},step=epoch)    
+                wandb.log({"LSD score": test_best_results[-7]},step=epoch)    
+                wandb.log({"CSL score": test_best_results[-8]},step=epoch) '''          
+                
+                if test_best_results[10]<=best_test_metric: #if we get a lower (better) GlobalSELD
+                    print("Saving BEST TEST model...")
+                    best_test_metric=test_best_results[10]
+                    
+                    if args.test_mode=='test_best':
+                        if new_best:
+                            state["best_test_epoch"]=state["best_epoch"]
+                        else:
+                            state["best_test_epoch"]=best_epoch_checkpoint
+                    else:
+                        state["best_test_epoch"]=epoch
+                    save_model(model, optimizer, state, checkpoint_path+'_best_model_on_Test',scheduler)
+                    
+                if args.test_mode=='test_best':
+                    state = load_model(model, optimizer, args.load_model, args.use_cuda,device,scheduler)
+                if new_best:
+                    new_best=False       
+            
+            if epoch% args.checkpoint_step==0:
+                checkpoint_dir=model_dir+'checkpoint_epoch_{}/'.format(epoch)
+                if len(os.path.dirname(checkpoint_dir)) > 0 and not os.path.exists(os.path.dirname(checkpoint_dir)):
+                    os.makedirs(os.path.dirname(checkpoint_dir))
+                print ('\n***************CHECKPOINT EPOCH {}****************'.format(epoch))
+                shutil.copyfile(checkpoint_best_model_path, checkpoint_dir+"checkpoint_best_epoch_{}".format(state["best_epoch"]))            
+                shutil.copyfile(checkpoint_path, checkpoint_dir+"checkpoint_epoch_{}".format(epoch))            
+                shutil.copyfile(checkpoint_path+'_best_model_on_Test', checkpoint_dir+"checkpoint_best_model_on_Test_epoch_{}".format(state["best_test_epoch"]))            
+                
+                shutil.copyfile(checkpoint_best_model_checkpoint_path, checkpoint_dir+"checkpoint_best_model_checkpoint_epoch_{}".format(best_epoch_checkpoint))
+                
+                shutil.copyfile("{}_training_metrics.csv".format(unique_name), checkpoint_dir+model.model_name+"_training_metrics_at_epoch_{}.csv".format(epoch))
+                shutil.copyfile("{}_test_metrics.csv".format(unique_name), checkpoint_dir+model.model_name+"_test_metrics_at_epoch_{}.csv".format(epoch))
+                
+            ########################################################################################################################################################
+    
+    #LOAD BEST MODEL AND COMPUTE LOSS FOR ALL SETS
+    print("TESTING")
+    # Load best model based on validation loss
+    state = load_model(model, None,  checkpoint_path+'_best_model_on_Test', args.use_cuda,device,scheduler)
+    #compute loss on all set_output_size
+    train_loss = evaluate(model, device, criterion_sed, criterion_doa, tr_data)
+    val_loss = evaluate(model, device, criterion_sed, criterion_doa, val_data)
+    test_loss = evaluate(model, device, criterion_sed, criterion_doa, test_data)
+
+    #PRINT AND SAVE RESULTS
+    results = {'train_loss': train_loss.cpu().detach().numpy(),
+               'val_loss': val_loss.cpu().detach().numpy(),
+               'test_loss': test_loss.cpu().detach().numpy(),
+               'train_loss_hist': train_loss_hist,
+               'val_loss_hist': val_loss_hist}
+
+    print(model.model_name)
+    print ('RESULTS')
+    for i in results:
+        if 'hist' not in i:
+            print (i, results[i])
+    out_path = os.path.join(args.results_path, 'results_dict.json')
+    np.save(out_path, results)
+    print('*********** TEST BEST MODEL (epoch {}) ************'.format(state['best_test_epoch']))
+    test_best_results=evaluate_test(model,device, test_data,epoch=state['best_test_epoch'],max_loc_value=args.max_loc_value,num_frames=args.num_frames,spatial_threshold=args.spatial_threshold)
+                        
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     #saving/loading parameters
